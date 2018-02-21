@@ -1,0 +1,586 @@
+---
+title: "House Prices: Advanced Regression Techniques"
+author: "Cris Pineda and Diego Hernández"
+date: "2/18/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading libraries:
+```{r echo=T, results='hide', message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(e1071)
+library(ModelMetrics)
+library(Metrics)
+library(factoextra)
+library(dummies)
+library(moments)
+dyn.load('/Library/Java/JavaVirtualMachines/jdk-9.0.1.jdk/Contents/Home/lib/server/libjvm.dylib') # in order for FSelector to work
+library(FSelector)
+library(data.table)
+library(xgboost)
+library(Metrics)
+library(Matrix)
+library(mice)
+library(elasticnet)
+```
+
+Loading training and testing data
+```{r echo=T, results='hide'}
+setwd("~/Desktop/Courses/Second Semester/Machine Learning II/Assignment 1")
+trainingH = read.csv("train.csv")
+testingH = read.csv("test.csv")
+```
+
+Splitting and saving the columns for later use
+```{r}
+# Save SalePrice for later
+SalePrice <- trainingH[ , which(names(trainingH) %in% c("SalePrice"))]
+# delete SalePrice
+trainingH$SalePrice = NULL
+
+# merge the two
+all = rbind(trainingH, testingH)
+
+levels(all$Utilities)
+levels(testingH$Utilities)
+
+# we will erase it cause there is only one different value
+all$Utilities = NULL
+```
+Just for reference : train = Id(1-1460)   test = Id(1461-2919)
+
+
+** DATA CLEANING **
+
+Check if we have duplicates values:
+```{r}
+length(unique(all$Id)) == nrow(all) # True
+```
+No duplicates
+
+Compute the number of NAs on each column:
+```{r}
+na.cols = which(colSums(is.na(all)) > 0)
+sort(colSums(sapply(all[na.cols], is.na)), decreasing = TRUE)
+paste('There are', length(na.cols), 'columns with missing values')
+```
+There are 33 columns with NAs so we will analyze and fix these.
+
+Let's check the quality of the pool with its area and we found that we only have 10 values for quality. NAs for PoolQC can be filled with 0 and the the only 3 values with pool can be filled with the mean value of its group
+```{r echo=T, results='hide'}
+# check which have a pool but are NA
+all[(all$PoolArea > 0) & is.na(all$PoolQC), c('PoolQC','PoolArea')]
+
+# ge the mean and count for PoolArea
+all %>%
+  group_by(PoolQC) %>%
+  select(PoolQC, PoolArea) %>%
+  summarise(avg_poolarea = mean(PoolArea, na.rm = T), count = n())
+
+# filter to see which are valid NAs
+all %>%
+  select(PoolQC, PoolArea) %>%
+  filter(is.na(PoolQC & PoolArea > 0))
+
+# impute the closest PoolQC to these
+all[2421,'PoolQC'] = 'Ex'
+all[2504,'PoolQC'] = 'Ex'
+all[2600,'PoolQC'] = 'Fa'
+```
+
+For GarageYr and YearBuilt we can infer that the garage was built the same year that the house was built
+```{r}
+length(which(all$GarageYrBlt == all$YearBuilt)) # 2216/2919 have the same year
+
+idx = which(is.na(all$GarageYrBlt))
+all[idx, 'GarageYrBlt'] = all[idx, 'YearBuilt']
+```
+
+We check the rest of the features related to the garage
+```{r}
+# group all the Garage variable to better analyze them
+garage.cols = c('GarageArea', 'GarageCars', 'GarageQual', 'GarageFinish', 'GarageCond', 'GarageType')
+all[is.na(all$GarageCond), garage.cols]
+
+idx = which(((all$GarageArea < 370) & (all$GarageArea > 350)) & (all$GarageCars == 1))
+
+names(sapply(all[idx, garage.cols], function(x) sort(table(x), decreasing=TRUE)[1]))
+
+# we fill NAs for the values it corresponds
+all[2127,'GarageQual'] = 'TA'
+all[2127, 'GarageFinish'] = 'Unf'
+all[2127, 'GarageCond'] = 'TA'
+
+# 2577 had NA instead of 0 but Semi-Det garage type with no info
+all[2577, 'GarageArea'] = 0
+all[2577, 'GarageCars'] = 0
+all[2577, 'GarageType'] = "NA"
+```
+
+Let's go for the KitchenQual:
+```{r}
+all %>%
+  group_by(KitchenQual) %>%
+  select(KitchenQual) %>%
+  summarise(count = n()) 
+
+# most common value is TA, we may fill NAs with this values
+all$KitchenQual[is.na(all$KitchenQual)] = 'TA'
+```
+
+We will keep doing this with more predictors:
+```{r}
+all %>%
+  group_by(Electrical) %>%
+  select(Electrical) %>%
+  summarise(count = n()) # SBrkr is the most common
+
+# impute most common
+all$Electrical[is.na(all$Electrical)] = 'SBrkr'
+
+all %>%
+  group_by(Electrical) %>%
+  select(Electrical) %>%
+  summarise(count = n())
+
+all %>%
+  group_by(SaleCondition) %>%
+  select(SaleCondition) %>%
+  summarise(count = n()) # let's compare SaleCondition with SaleType as both seem to be related features
+
+table(all$SaleCondition, all$SaleType) # most of the Normal(SaleCondition) house have WD as SaleType
+all$SaleType[is.na(all$SaleType)] = 'WD'
+
+all %>%
+  group_by(Functional) %>%
+  select(Functional) %>%
+  summarise(count = n())
+
+# impute for NA
+all$Functional[is.na(all$Functional)] = 'Typ'
+
+
+all %>%
+  group_by(MSZoning) %>%
+  select(MSZoning) %>%
+  summarise(count = n()) # RL
+
+# impute most common
+all$MSZoning[is.na(all$MSZoning)] = 'RL'
+```
+
+Let's look at LotFrontage
+```{r}
+# view how many neighborhoods
+levels(all$Neighborhood)
+
+# get median for Neighborhood
+all %>%
+  group_by(Neighborhood) %>%
+    summarise(median_lotFRont = median(LotFrontage, na.rm = T))
+
+# replace NA with the median
+all$LotFrontage = with(all, ave(LotFrontage, Neighborhood,
+    FUN = function(x) replace(x, is.na(x), median(x, na.rm = TRUE))))
+```
+
+Change some of the NAs with other values
+```{r}
+moreNAs <- which(colSums(is.na(all)) > 0)
+sort(colSums(sapply(all[moreNAs], is.na)), decreasing = TRUE)
+
+
+paste('There are', length(moreNAs), 'columns with missing values')
+```
+There are still 24 columns with NAs
+
+Dealing with the rest of the NAs
+USE THIS AS REFERENCE TO CONSTANTLY CHECK: 
+sort(colSums(sapply(all[moreNAs], is.na)), decreasing = TRUE)
+```{r}
+## use this as reference and adjust X axis for each variable
+ggplot(data = all, aes(x = PoolQC)) + 
+  geom_bar(fill = 'blue') +
+  geom_text(aes(label = ..count..), stat='count', vjust=-0.5)
+
+# Pool QC
+all$PoolQC = factor(all$PoolQC, levels=c(levels(all$PoolQC), "None"))
+all$PoolQC[is.na(all$PoolQC)] = "None"
+
+# MiscFeature
+all$MiscFeature = factor(all$MiscFeature, levels=c(levels(all$MiscFeature), "None"))
+all$MiscFeature[is.na(all$MiscFeature)] = "None"
+
+# Alley
+
+all$Alley = factor(all$Alley, levels=c(levels(all$Alley), "None"))
+all$Alley[is.na(all$Alley)] = "None"
+
+# Fence
+all$Fence = factor(all$Fence, levels=c(levels(all$Fence), "None"))
+all$Fence[is.na(all$Fence)] = "None"
+
+# FireplaceQu
+## 1420 NAs
+# see how many fireplaces are 0 and see if matches NAs
+ggplot(data = all, aes(x = Fireplaces)) + 
+  geom_bar(fill = 'blue') +
+  geom_text(aes(label = ..count..), stat='count', vjust=-0.5) # they match
+all$FireplaceQu = factor(all$FireplaceQu, levels=c(levels(all$FireplaceQu), "None"))
+all$FireplaceQu[is.na(all$FireplaceQu)] = "None"
+```
+
+Dealing with the NAs for all the variables related to Garage
+```{r}
+# Garages : NA for garage features is "no garage"
+## first lets make sure the 158 matches 0 car garages
+ggplot(data = all, aes(x = GarageCars)) + 
+  geom_bar(fill = 'blue') +
+  geom_text(aes(label = ..count..), stat='count', vjust=-0.5) # they match
+# GarageType
+all$GarageType = factor(all$GarageType, levels=c(levels(all$GarageType), "None"))
+all$GarageType[is.na(all$GarageType)] = "None"
+# GarageFinish
+all$GarageFinish = factor(all$GarageFinish, levels=c(levels(all$GarageFinish), "None"))
+all$GarageFinish[is.na(all$GarageFinish)] = "None"
+# GarageQual
+all$GarageQual = factor(all$GarageQual, levels=c(levels(all$GarageQual), "None"))
+all$GarageQual[is.na(all$GarageQual)] = "None"
+# GarageCond
+all$GarageCond = factor(all$GarageCond, levels=c(levels(all$GarageCond), "None"))
+all$GarageCond[is.na(all$GarageCond)] = "None"
+```
+
+Next for Basement variables
+```{r}
+# Basements
+## function to group basements
+bsmt.cols <- names(all)[sapply(names(all), function(x) str_detect(x, 'Bsmt'))]
+
+# BsmtExposure
+ggplot(data = all, aes(x = BsmtExposure)) + 
+  geom_bar(fill = 'blue') +
+  geom_text(aes(label = ..count..), stat='count', vjust=-0.5)
+all[is.na(all$BsmtExposure),bsmt.cols] #949, 1488, 2349
+# we fill NAs with most common that actually have garages
+all[949,'BsmtExposure'] = 'No' 
+all[1488, 'BsmtExposure'] = 'No'
+all[2349, 'BsmtExposure'] = 'No'
+# now fill with None
+all$BsmtExposure = factor(all$BsmtExposure, levels=c(levels(all$BsmtExposure), "None"))
+all$BsmtExposure[is.na(all$BsmtExposure)] = "None"
+
+# BsmtCond
+ggplot(data = all, aes(x = BsmtCond)) + 
+  geom_bar(fill = 'blue') +
+  geom_text(aes(label = ..count..), stat='count', vjust=-0.5)
+all[is.na(all$BsmtCond),bsmt.cols] # 2041, 2186, 2525 
+# these have basements, fill with most common
+all[2041,'BsmtCond'] = 'TA' 
+all[2186, 'BsmtCond'] = 'TA'
+all[2525, 'BsmtCond'] = 'TA'
+# now fill NA with none
+all$BsmtCond = factor(all$BsmtCond, levels=c(levels(all$BsmtCond), "None"))
+all$BsmtCond[is.na(all$BsmtCond)] = "None"
+
+# BsmtQual
+## 2218 & 2219 do have basements so putting it same as BsmtCond 
+all[2218,'BsmtQual'] = 'Fa' 
+all[2219, 'BsmtQual'] = 'TA'
+# now fix NAs
+all$BsmtQual = factor(all$BsmtQual, levels=c(levels(all$BsmtQual), "None"))
+all$BsmtQual[is.na(all$BsmtQual)] = "None"
+
+# BsmtFinType2
+## 333 should not be NA, just make it same as BsmtFinType1
+all[333,'BsmtFinType2'] = 'GLQ' 
+# now fill NA with none
+all$BsmtFinType2 = factor(all$BsmtFinType2, levels=c(levels(all$BsmtFinType2), "None"))
+all$BsmtFinType2[is.na(all$BsmtFinType2)] = "None"
+
+# BsmtFinType1 is good to change to none
+all$BsmtFinType1 = factor(all$BsmtFinType1, levels=c(levels(all$BsmtFinType1), "None"))
+all$BsmtFinType1[is.na(all$BsmtFinType1)] = "None"
+
+# BsmtExposure
+## most are No so just change it
+all$BsmtExposure[is.na(all$BsmtExposure)] = "No"
+
+# BsmtFullBath & Half Bath just need 0
+all$BsmtFullBath[is.na(all$BsmtFullBath)] <- 0
+all$BsmtHalfBath[is.na(all$BsmtHalfBath)] <- 0
+
+# BsmtFinSF1, BsmtFinSF2,TotalBsmtSF, BsmtUnfSF
+## row 2121 has no basment so can impute o for each
+all[2121,'BsmtFinSF1'] = 0
+all[2121,'BsmtFinSF2'] = 0
+all[2121,'TotalBsmtSF'] = 0
+all[2121,'BsmtUnfSF'] = 0
+```
+We used: "sort(colSums(sapply(all[moreNAs], is.na)), decreasing = TRUE)" and "View(all[is.na(all$BsmtExposure),bsmt.cols])" to analyze each variable and manually fix errors between NAs that should be NA and not
+
+Finish off the NAs
+```{r}
+# Exterior1st & Exterior2nd
+all[is.na(all$Exterior1st),] # row 2152 only one
+levels(all$Exterior1st)
+# plot
+ggplot(data = all, aes(x = Exterior1st)) + 
+  geom_bar(fill = 'blue') +
+  geom_text(aes(label = ..count..), stat='count', vjust=-0.5)
+# change to VinylSd for now since it is most common
+all$Exterior1st[is.na(all$Exterior1st)] = "VinylSd"
+# also for Exterior2nd
+all$Exterior2nd[is.na(all$Exterior2nd)] = "VinylSd"
+
+# MasVnrType & MasVnrArea
+MasVnr.cols <- names(all)[sapply(names(all), function(x) str_detect(x, 'MasVnr'))]
+all[is.na(all$MasVnrType),MasVnr.cols]
+# put most used
+all[2611, 'MasVnrType'] = 'BrkFace'
+# change to MasVnrType
+all$MasVnrType[is.na(all$MasVnrType)] = "None"
+# also for MasVnrArea
+all$MasVnrArea[is.na(all$MasVnrArea)] = 0
+```
+
+We will change CentralAir manually since it should be binary
+```{r}
+## manually change CentralAir to avoid making excessive
+all <- all %>%
+  mutate(CentralAir = ifelse(CentralAir == "Y", 1, 0))
+```
+
+Here we will apply one-hot encoding for every non numeric variable, first we will get those variables and then we will make use of the caret package
+```{r}
+type_of_vars = sapply(names(all), function(x){class(all[[x]])})
+numeric_vars = names(type_of_vars[type_of_vars == "integer"])
+categorical_vars = names(type_of_vars[type_of_vars != "integer"])
+
+dummies = dummyVars(~.,all[categorical_vars])
+categorical_1_hot = predict(dummies,all[categorical_vars])
+categorical_1_hot[is.na(categorical_1_hot)] = 0  
+```
+
+Now lets convert all numericals that should be categorial to avoid any skewing we might do
+```{r}
+# take a look and see which ones should be changed
+glimpse(all)
+
+all$MSSubClass = as.factor(all$MSSubClass)
+all$OverallQual = as.factor(all$OverallQual)
+all$OverallCond = as.factor(all$OverallCond)
+all$YearBuilt = as.factor(all$YearBuilt)
+all$YearRemodAdd = as.factor(all$YearRemodAdd)
+all$CentralAir = as.factor(all$CentralAir)
+all$BsmtHalfBath = as.factor(all$BsmtHalfBath)
+all$BsmtFullBath = as.factor(all$BsmtFullBath)
+all$KitchenAbvGr = as.factor(all$KitchenAbvGr)
+all$TotRmsAbvGrd = as.factor(all$TotRmsAbvGrd)
+all$GarageYrBlt = as.factor(all$GarageYrBlt)
+all$MoSold = as.factor(all$MoSold)
+all$YrSold = as.factor(all$YrSold)
+```
+
+lets check for skewness of SalePrice
+```{r}
+# get data frame of SalePrice and log(SalePrice + 1) for plotting
+df <- rbind(data.frame(version="log(price+1)",x=log(SalePrice + 1)),
+            data.frame(version="price",x=SalePrice))
+# version is name of what you want to call it
+
+ggplot(data=df) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x), bins = 50)
+```
+
+We therefore transform the target value applying log
+```{r Log transform the target for official scoring}
+# Log transform the target for official scoring
+SalePrice <- log1p(SalePrice)
+```
+
+Skew the numeric variables
+```{r}
+column_types = sapply(names(all), function(x){class(all[[x]])})
+numeric_columns =names(column_types[column_types != "factor"])
+
+# skew of each variable
+skew = sapply(numeric_columns,function(x){skewness(all[[x]],na.rm = T)})
+
+# transform all variables above a threshold skewness.
+skew = skew[skew > 0.75]
+for(x in names(skew)) {
+    all[[x]] = log(all[[x]] + 1)  
+}
+```
+
+Add the dummy variables to the existing data frame
+```{r}
+all = cbind(all[numeric_vars], categorical_1_hot)
+```
+
+** UNMERGE DATA **
+
+Now lets unmerge the data frame so we can analyze the dependency of SalePrice
+```{r}
+X_train = all[1:nrow(trainingH),] # training data
+X_test = all[(nrow(trainingH) + 1):nrow(all),] # test data
+X_train = cbind(SalePrice, X_train) # adding SalePrice to training
+```
+
+** Remove Some Outliers **
+
+GrLivArea
+```{r echo=T, results='hide'}
+# read the kaggle info and it says to remove outliers greater than 4000
+ggplot(data=X_train) +
+  geom_point(mapping=aes(x=GrLivArea, y=SalePrice))
+
+# view those outliers
+X_train %>%
+  arrange(desc(GrLivArea)) %>%
+  head(2)
+
+# get rid of outliers
+X_train <- X_train[X_train$GrLivArea<8.45, ]
+```
+
+View the new plot
+```{r}
+# MasVnrArea
+ggplot(data=X_train) +
+  geom_point(mapping=aes(x=MasVnrArea, y=SalePrice))
+```
+
+
+** THE MODEL **
+**THIS IS THE PROFESSOR'S CODE FROM OUR MACHINE LEARNING COURSE**
+Includes a little modification
+```{r Train test split}
+# I found this function, that is worth to save for future ocasions.
+splitdf = function(dataframe, seed=NULL) {
+  if (!is.null(seed)) set.seed(seed)
+ 	index = 1:nrow(dataframe)
+ 	trainindex = sample(index, trunc(length(index)/1.5))
+ 	trainset = dataframe[trainindex, ]
+ 	testset = dataframe[-trainindex, ]
+ 	list(trainset=trainset,testset=testset)
+}
+
+splits = splitdf(X_train, seed=1)
+training = splits$trainset
+validation = splits$testset
+```
+
+## Chi-Squared
+
+We will compute the CHI SQ to check the level of association between variables
+```{r}
+weights_chi = data.frame(chi.squared(SalePrice~., X_train))
+weights_chi$feature = rownames(weights_chi)
+weights_chi[order(weights_chi$attr_importance, decreasing = TRUE),]
+
+chi_squared_features = weights_chi$feature[weights_chi$attr_importance >= 0.15]
+
+```
+
+Based on these results, we filter the training and validation set with the Information Gain features.
+```{r}
+training = training[append(chi_squared_features, "SalePrice")]
+validation = validation[append(chi_squared_features, "SalePrice")]
+```
+
+
+We chose to use Lasso since it gave us a lower RMSE compared to Ridge and Elastic.
+
+### Lasso Regresion
+
+EVALUTION
+Plot the RMSE for the different lambda values and Explain the results.
+```{r}
+lambdas = 10^seq(-6, 6, by = 0.001)
+#alphas = 10^seq(0, 1, by = 0.01) # didnt use
+
+
+lasso.cv_fit = cv.glmnet(x = data.matrix(training[,-ncol(training)]), y=training$SalePrice, alpha = 1, lambda = lambdas)
+plot(lasso.cv_fit)
+```
+
+Select the best lambda form the CV model, use it to predict the target value of the validation set and evaluate the results (in terms of RMSE)
+```{r}
+bestlam = lasso.cv_fit$lambda.min
+paste("Best Lambda value from CV=", bestlam)
+```
+
+```{r}
+lasso.mod = glmnet(x = data.matrix(training[,-ncol(training)]), y=training$SalePrice, alpha = 1, lambda = lambdas)
+lasso.pred=predict(lasso.mod, s=bestlam, data.matrix(validation[,-ncol(validation)]))
+paste("RMSE for lambda ", bestlam, " = ", sqrt(mean((lasso.pred - validation$SalePrice)^2)))
+```
+
+Select the λ1se value from the CV model to predict on the validation set
+```{r}
+lam1se = lasso.cv_fit$lambda.1se
+paste("Lambda 1se value from CV=", lam1se)
+```
+
+```{r}
+lasso.mod = glmnet(x = data.matrix(training[,-ncol(training)]), y=training$SalePrice, alpha = 1, lambda = lambdas)
+lasso.pred=predict(lasso.mod, s=lam1se, data.matrix(validation[,-ncol(validation)]))
+paste("RMSE for lambda ", lam1se, " = ", sqrt(mean((lasso.pred - validation$SalePrice)^2)))
+```
+
+Predictions against the actual values
+```{r}
+# Plot important coefficients
+my_data=as.data.frame(cbind(predicted=lasso.pred,observed=validation$SalePrice))
+
+ggplot(my_data,aes(my_data["1"],observed))+
+  geom_point()+geom_smooth(method="lm")+
+  scale_x_continuous(expand = c(0,0)) +
+  labs(x="Predicted") +
+  ggtitle('Lasso')
+```
+
+Variable importance
+```{r}
+# Print, plot variable importance
+imp = varImp(lasso.mod, lambda = bestlam)
+names = rownames(imp)[order(imp$Overall, decreasing=TRUE)]
+importance = imp[names,]
+
+data.frame(row.names = names, importance)
+```
+
+
+|PREDICTION FOR THE TEST DATA|
+
+```{r}
+log_prediction = predict(lasso.cv_fit,  s=lasso.cv_fit$lambda.min, newx = data.matrix(X_test[chi_squared_features]))
+
+actual_pred = exp(log_prediction)-1
+
+hist(actual_pred)
+```
+
+```{r}
+submit = data.frame(Id= X_test$Id,SalePrice=actual_pred)
+colnames(submit) =c("Id", "SalePrice")
+
+submit$SalePrice[is.na(submit$SalePrice)] = 0
+replace_value_for_na = sum(na.omit(submit$SalePrice))/(nrow(submit) - sum(submit$SalePrice == 0))
+submit$SalePrice[submit$SalePrice == 0] = replace_value_for_na
+
+write.csv(submit,file="lasso_cris_diego_best.csv",row.names=F)
+```
+
+Using this code, we were able to get a RMSE for the House Prices Kaggle Competion of 0.12115. We can further improve it but this was the final version we submitted.
